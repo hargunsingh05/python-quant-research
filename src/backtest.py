@@ -5,10 +5,40 @@ import matplotlib.pyplot as plt
 
 TICKER = "AAPL"
 START_DATE = "2021-01-01"
+SPLIT_DATE = "2025-01-01"
 SHORT_WINDOW = 20
 LONG_WINDOW = 50
 TRANSACTION_COST = 0.001
 TRADING_DAYS = 252
+
+
+def calculate_metrics(returns):
+    returns = returns.dropna()
+
+    equity = (1 + returns).cumprod()
+    cumulative_return = equity.iloc[-1] - 1
+    annual_return = equity.iloc[-1] ** (
+        TRADING_DAYS / len(returns)
+    ) - 1
+    annual_volatility = returns.std(ddof=1) * np.sqrt(TRADING_DAYS)
+
+    daily_std = returns.std(ddof=1)
+    sharpe = (
+        returns.mean() / daily_std * np.sqrt(TRADING_DAYS)
+        if daily_std > 0
+        else np.nan
+    )
+
+    drawdown = equity / equity.cummax() - 1
+
+    return {
+        "Cumulative Return": cumulative_return,
+        "Annualised Return": annual_return,
+        "Annualised Volatility": annual_volatility,
+        "Sharpe Ratio (rf=0)": sharpe,
+        "Maximum Drawdown": drawdown.min(),
+    }
+
 
 print(f"Downloading {TICKER} data...")
 
@@ -28,23 +58,19 @@ if isinstance(prices, pd.DataFrame):
     prices = prices.iloc[:, 0]
 
 prices = prices.dropna().rename("Price")
-
 data = pd.DataFrame({"Price": prices})
 data["Return"] = data["Price"].pct_change()
 
+# Indicators use historical prices only.
 data["SMA_Short"] = data["Price"].rolling(SHORT_WINDOW).mean()
 data["SMA_Long"] = data["Price"].rolling(LONG_WINDOW).mean()
 
-# Signal uses today's closing price.
-# Position is shifted so today's signal only affects tomorrow's return.
 data["Signal"] = (
     data["SMA_Short"] > data["SMA_Long"]
 ).astype(float)
 
+# Today's closing signal determines tomorrow's position.
 data["Position"] = data["Signal"].shift(1).fillna(0.0)
-
-# Remove warm-up period before evaluating either approach.
-data = data.dropna(subset=["SMA_Long", "Return"]).copy()
 
 data["Turnover"] = data["Position"].diff().abs()
 data["Turnover"] = data["Turnover"].fillna(data["Position"].abs())
@@ -56,85 +82,81 @@ data["Strategy_Return"] = (
 
 data["Buy_Hold_Return"] = data["Return"]
 
-data["Strategy_Equity"] = (1 + data["Strategy_Return"]).cumprod()
-data["Buy_Hold_Equity"] = (1 + data["Buy_Hold_Return"]).cumprod()
+# Start evaluation once both indicators and returns are available.
+data = data.dropna(subset=["SMA_Long", "Return"]).copy()
 
-def calculate_metrics(returns, equity):
-    returns = returns.dropna()
+# Development and out-of-sample periods use the same fixed strategy.
+development = data[data.index < SPLIT_DATE].copy()
+out_of_sample = data[data.index >= SPLIT_DATE].copy()
 
-    annual_return = equity.iloc[-1] ** (
-        TRADING_DAYS / len(returns)
-    ) - 1
+if len(development) < 2 or len(out_of_sample) < 2:
+    raise RuntimeError("Not enough observations in one of the test periods.")
 
-    annual_volatility = returns.std(ddof=1) * np.sqrt(TRADING_DAYS)
+# Calculate each period's growth independently, starting at £1.
+for period in (development, out_of_sample):
+    period["Strategy_Equity"] = (
+        1 + period["Strategy_Return"]
+    ).cumprod()
+    period["Buy_Hold_Equity"] = (
+        1 + period["Buy_Hold_Return"]
+    ).cumprod()
 
-    daily_risk_free_rate = 0.0
-    excess_returns = returns - daily_risk_free_rate
-
-    sharpe = (
-        excess_returns.mean() / returns.std(ddof=1) * np.sqrt(TRADING_DAYS)
-        if returns.std(ddof=1) > 0
-        else np.nan
-    )
-
-    drawdown = equity / equity.cummax() - 1
-
-    return {
-        "Cumulative Return": equity.iloc[-1] - 1,
-        "Annualised Return": annual_return,
-        "Annualised Volatility": annual_volatility,
-        "Sharpe Ratio (rf=0)": sharpe,
-        "Maximum Drawdown": drawdown.min(),
-    }
-
-strategy_metrics = calculate_metrics(
-    data["Strategy_Return"], data["Strategy_Equity"]
-)
-
-buy_hold_metrics = calculate_metrics(
-    data["Buy_Hold_Return"], data["Buy_Hold_Equity"]
-)
-
-results = pd.DataFrame({
-    "Moving Average Strategy": strategy_metrics,
-    "Buy and Hold": buy_hold_metrics,
+development_metrics = pd.DataFrame({
+    "Moving Average Strategy": calculate_metrics(
+        development["Strategy_Return"]
+    ),
+    "Buy and Hold": calculate_metrics(
+        development["Buy_Hold_Return"]
+    ),
 })
 
-# Count transitions between invested and uninvested states.
-trade_entries = (
-    (data["Position"] == 1) &
-    (data["Position"].shift(1).fillna(0) == 0)
-).sum()
+oos_metrics = pd.DataFrame({
+    "Moving Average Strategy": calculate_metrics(
+        out_of_sample["Strategy_Return"]
+    ),
+    "Buy and Hold": calculate_metrics(
+        out_of_sample["Buy_Hold_Return"]
+    ),
+})
 
-time_in_market = data["Position"].mean()
-
-print("\nBACKTEST REPORT")
+print("\nDEVELOPMENT PERIOD")
 print("=" * 60)
-print(f"Ticker: {TICKER}")
-print(f"Period: {data.index.min().date()} to {data.index.max().date()}")
-print(f"Observations: {len(data)}")
-print(f"Moving averages: {SHORT_WINDOW}/{LONG_WINDOW} days")
-print(f"Transaction cost: {TRANSACTION_COST:.2%} per unit of turnover")
-print(f"Strategy entries: {trade_entries}")
-print(f"Time in market: {time_in_market:.1%}")
-print("\nPerformance metrics:")
-print(results.to_string(float_format=lambda x: f"{x:.3f}"))
+print(
+    f"{development.index.min().date()} to "
+    f"{development.index.max().date()}"
+)
+print(development_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
 
-data.to_csv("results/backtest_results.csv")
-results.to_csv("results/backtest_metrics.csv")
+print("\nOUT-OF-SAMPLE PERIOD")
+print("=" * 60)
+print(
+    f"{out_of_sample.index.min().date()} to "
+    f"{out_of_sample.index.max().date()}"
+)
+print(oos_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
 
+# Save period-specific results.
+development_metrics.to_csv("results/development_metrics.csv")
+oos_metrics.to_csv("results/out_of_sample_metrics.csv")
+development.to_csv("results/development_results.csv")
+out_of_sample.to_csv("results/out_of_sample_results.csv")
+
+# Plot out-of-sample equity and drawdown only.
 fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
 
-data[["Strategy_Equity", "Buy_Hold_Equity"]].plot(ax=axes[0])
-axes[0].set_title("Strategy vs Buy-and-Hold")
-axes[0].set_ylabel("Growth of £1 (before taxes)")
+out_of_sample[
+    ["Strategy_Equity", "Buy_Hold_Equity"]
+].plot(ax=axes[0])
+axes[0].set_title("Out-of-Sample: Strategy vs Buy-and-Hold")
+axes[0].set_ylabel("Growth of £1")
 
 strategy_drawdown = (
-    data["Strategy_Equity"] / data["Strategy_Equity"].cummax() - 1
+    out_of_sample["Strategy_Equity"]
+    / out_of_sample["Strategy_Equity"].cummax() - 1
 )
-
 buy_hold_drawdown = (
-    data["Buy_Hold_Equity"] / data["Buy_Hold_Equity"].cummax() - 1
+    out_of_sample["Buy_Hold_Equity"]
+    / out_of_sample["Buy_Hold_Equity"].cummax() - 1
 )
 
 pd.DataFrame({
@@ -142,11 +164,11 @@ pd.DataFrame({
     "Buy and Hold": buy_hold_drawdown,
 }).plot(ax=axes[1])
 
-axes[1].set_title("Drawdown Comparison")
+axes[1].set_title("Out-of-Sample Drawdown")
 axes[1].set_ylabel("Drawdown")
 
 fig.tight_layout()
-fig.savefig("results/backtest.png", dpi=150)
+fig.savefig("results/out_of_sample_backtest.png", dpi=150)
 plt.show()
 
-print("\nSaved updated backtest results in results/.")
+print("\nSaved development and out-of-sample reports in results/.")
